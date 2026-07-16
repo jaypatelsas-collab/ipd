@@ -3,6 +3,8 @@ import io
 import os
 import zipfile
 import hashlib
+import re
+import traceback
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -72,11 +74,24 @@ def read_dataset_safe(file_or_path, filename: str | None = None) -> pd.DataFrame
 
 
 def domain_from_filename(filename: str):
+    """Infer an SDTM domain from flexible filenames and nested ZIP paths."""
     stem = os.path.splitext(os.path.basename(filename).lower())[0]
+    normalized = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
     aliases = {"suppcm": "cm", "suppdv": "dv"}
-    if stem in REQUIRED_DOMAINS:
-        return stem
-    return aliases.get(stem)
+    if normalized in REQUIRED_DOMAINS:
+        return normalized
+    if normalized in aliases:
+        return aliases[normalized]
+    # Accept names such as cm_2026, sdtm_cm, study-cm-final, dm_data.
+    tokens = [t for t in normalized.split("_") if t]
+    for dom in REQUIRED_DOMAINS:
+        if dom in tokens:
+            return dom
+    # Conservative prefix/suffix fallback.
+    for dom in REQUIRED_DOMAINS:
+        if normalized.startswith(dom) or normalized.endswith(dom):
+            return dom
+    return None
 
 
 @st.cache_data(show_spinner=False)
@@ -590,9 +605,11 @@ try:
     review, info = prepare_review_dataset(data, rules)
     review, rule_findings = evaluate_study_rules(review, data, rules)
 except Exception as e:
-    st.error("Data could not be processed. Please confirm the uploaded package includes Source_CSV/cm.csv and related SDTM files.")
-    with st.expander("Technical detail"):
+    st.error("Data could not be processed. The failure is shown below; the app no longer requires a Source_CSV folder.")
+    st.info("Accepted domain examples include cm.csv, CM.xpt, sdtm_cm.sas7bdat, or nested ZIP paths containing those files.")
+    with st.expander("Technical detail", expanded=True):
         st.exception(e)
+        st.code(traceback.format_exc())
     st.stop()
 
 if info.get("error"):
