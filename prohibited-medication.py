@@ -2,6 +2,7 @@
 import io
 import os
 import zipfile
+import hashlib
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -18,6 +19,9 @@ APP_SUBTITLE = "Prohibited Medication Review | Dummy Oncology Study DUM-ONC-001"
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 SRC_DIR = os.path.join(DATA_DIR, "Source_CSV")
 CT_DIR = os.path.join(DATA_DIR, "Controlled_Terminology")
+RULES_PATH = os.path.join(DATA_DIR, "study_rules.csv")
+RULES_XLSX_PATH = os.path.join(DATA_DIR, "Study_Rules_DUM_ONC_001.xlsx")
+XPT_DIR = os.path.join(DATA_DIR, "SDTM_XPT")
 
 REQUIRED_DOMAINS = ["dm", "ex", "cm", "ae", "dv", "ds", "lb", "vs"]
 
@@ -42,13 +46,49 @@ def safe_date(df: pd.DataFrame, col: str) -> pd.Series:
 def read_csv_safe(path_or_buffer) -> pd.DataFrame:
     return normalize_columns(pd.read_csv(path_or_buffer))
 
+
+def read_sas_safe(path_or_buffer, extension: str) -> pd.DataFrame:
+    extension = extension.lower()
+    fmt = "xport" if extension in [".xpt", ".xport"] else "sas7bdat"
+    return normalize_columns(pd.read_sas(path_or_buffer, format=fmt, encoding="utf-8"))
+
+
+def read_dataset_safe(file_or_path, filename: str | None = None) -> pd.DataFrame:
+    name = (filename or getattr(file_or_path, "name", "") or str(file_or_path)).lower()
+    ext = os.path.splitext(name)[1]
+    if ext == ".csv":
+        return read_csv_safe(file_or_path)
+    if ext in [".xpt", ".xport", ".sas7bdat"]:
+        # UploadedFile/ZipExtFile objects are buffered to avoid seek limitations.
+        if hasattr(file_or_path, "read") and not isinstance(file_or_path, (str, os.PathLike)):
+            raw = file_or_path.read()
+            try:
+                file_or_path.seek(0)
+            except Exception:
+                pass
+            return read_sas_safe(io.BytesIO(raw), ext)
+        return read_sas_safe(file_or_path, ext)
+    raise ValueError(f"Unsupported dataset type: {ext or name}")
+
+
+def domain_from_filename(filename: str):
+    stem = os.path.splitext(os.path.basename(filename).lower())[0]
+    aliases = {"suppcm": "cm", "suppdv": "dv"}
+    if stem in REQUIRED_DOMAINS:
+        return stem
+    return aliases.get(stem)
+
+
 @st.cache_data(show_spinner=False)
 def load_default_data():
     data = {}
     for dom in REQUIRED_DOMAINS:
-        path = os.path.join(SRC_DIR, f"{dom}.csv")
-        if os.path.exists(path):
-            data[dom] = read_csv_safe(path)
+        csv_path = os.path.join(SRC_DIR, f"{dom}.csv")
+        xpt_path = os.path.join(XPT_DIR, f"{dom}.xpt")
+        if os.path.exists(csv_path):
+            data[dom] = read_dataset_safe(csv_path, f"{dom}.csv")
+        elif os.path.exists(xpt_path):
+            data[dom] = read_dataset_safe(xpt_path, f"{dom}.xpt")
         else:
             data[dom] = pd.DataFrame()
 
@@ -56,54 +96,61 @@ def load_default_data():
     whodrug_path = os.path.join(CT_DIR, "whodrug_atc_dummy_dictionary.csv")
     data["prohibited"] = read_csv_safe(pm_path) if os.path.exists(pm_path) else pd.DataFrame()
     data["whodrug"] = read_csv_safe(whodrug_path) if os.path.exists(whodrug_path) else pd.DataFrame()
+    data["source_formats"] = "Bundled CSV/XPT"
     return data
+
+
+def empty_data():
+    data = {dom: pd.DataFrame() for dom in REQUIRED_DOMAINS}
+    data["prohibited"] = pd.DataFrame()
+    data["whodrug"] = pd.DataFrame()
+    return data
+
 
 def load_uploaded_zip(uploaded_file):
-    data = {dom: pd.DataFrame() for dom in REQUIRED_DOMAINS}
-    data["prohibited"] = pd.DataFrame()
-    data["whodrug"] = pd.DataFrame()
-
+    data = empty_data()
+    loaded_formats = []
     with zipfile.ZipFile(uploaded_file) as z:
         names = [n for n in z.namelist() if not n.startswith("__MACOSX/") and not os.path.basename(n).startswith("._")]
-
-        def find_csv(filename):
-            filename = filename.lower()
-            hits = [n for n in names if n.lower().endswith(filename)]
-            return hits[0] if hits else None
-
-        for dom in REQUIRED_DOMAINS:
-            n = find_csv(f"{dom}.csv")
-            if n:
-                with z.open(n) as f:
-                    data[dom] = read_csv_safe(f)
-
-        n = find_csv("prohibited_medication_list.csv")
-        if n:
+        # Prefer SAS7BDAT, then XPT, then CSV when duplicate domains exist.
+        priority = {".sas7bdat": 3, ".xpt": 2, ".xport": 2, ".csv": 1}
+        candidates = {}
+        for n in names:
+            ext = os.path.splitext(n.lower())[1]
+            dom = domain_from_filename(n)
+            if dom and ext in priority:
+                if dom not in candidates or priority[ext] > priority[os.path.splitext(candidates[dom].lower())[1]]:
+                    candidates[dom] = n
+        for dom, n in candidates.items():
             with z.open(n) as f:
-                data["prohibited"] = read_csv_safe(f)
-
-        n = find_csv("whodrug_atc_dummy_dictionary.csv")
-        if n:
-            with z.open(n) as f:
-                data["whodrug"] = read_csv_safe(f)
-
+                data[dom] = read_dataset_safe(f, n)
+                loaded_formats.append(f"{dom.upper()}:{os.path.splitext(n)[1].upper()}")
+        for n in names:
+            low = n.lower()
+            if low.endswith("prohibited_medication_list.csv"):
+                with z.open(n) as f: data["prohibited"] = read_csv_safe(f)
+            elif low.endswith("whodrug_atc_dummy_dictionary.csv"):
+                with z.open(n) as f: data["whodrug"] = read_csv_safe(f)
+    data["source_formats"] = ", ".join(loaded_formats) or "No supported domains found"
     return data
 
-def load_uploaded_csvs(files):
-    data = {dom: pd.DataFrame() for dom in REQUIRED_DOMAINS}
-    data["prohibited"] = pd.DataFrame()
-    data["whodrug"] = pd.DataFrame()
 
+def load_uploaded_datasets(files):
+    data = empty_data()
+    loaded_formats = []
     for f in files:
         name = f.name.lower()
-        df = read_csv_safe(f)
-        for dom in REQUIRED_DOMAINS:
-            if name == f"{dom}.csv" or name.endswith(f"/{dom}.csv"):
-                data[dom] = df
-        if "prohibited_medication" in name:
-            data["prohibited"] = df
-        if "whodrug" in name or "dictionary" in name:
-            data["whodrug"] = df
+        if "prohibited_medication" in name and name.endswith(".csv"):
+            data["prohibited"] = read_csv_safe(f)
+            continue
+        if ("whodrug" in name or "dictionary" in name) and name.endswith(".csv"):
+            data["whodrug"] = read_csv_safe(f)
+            continue
+        dom = domain_from_filename(name)
+        if dom:
+            data[dom] = read_dataset_safe(f, name)
+            loaded_formats.append(f"{dom.upper()}:{os.path.splitext(name)[1].upper()}")
+    data["source_formats"] = ", ".join(loaded_formats) or "No supported domains found"
     return data
 
 def max_date(series):
@@ -114,7 +161,202 @@ def min_date(series):
     s = pd.to_datetime(series, errors="coerce")
     return s.min() if not s.dropna().empty else pd.NaT
 
-def prepare_review_dataset(data):
+
+RULE_COLUMNS = ["RULE_ID", "SOURCE", "SECTION", "RULE_NAME", "DESCRIPTION", "SEVERITY", "ENABLED", "RULE_TYPE", "DOMAIN", "MATCH_FIELDS", "OPERATOR", "PARAMETER", "EXPECTED_VALUE", "IMPORTANT_PD", "ACTION"]
+
+
+def standardize_rules(rules: pd.DataFrame) -> pd.DataFrame:
+    rules = normalize_columns(rules)
+    # Backward-compatible mapping for the prior CSV template.
+    if "MATCH_FIELDS" not in rules.columns and "RULE_TYPE" in rules.columns:
+        rules["MATCH_FIELDS"] = ""
+    if "OPERATOR" not in rules.columns:
+        rules["OPERATOR"] = ""
+    if "DOMAIN" not in rules.columns:
+        rules["DOMAIN"] = ""
+    if "IMPORTANT_PD" not in rules.columns:
+        rules["IMPORTANT_PD"] = ""
+    if "ACTION" not in rules.columns:
+        rules["ACTION"] = ""
+    for col in RULE_COLUMNS:
+        if col not in rules.columns:
+            rules[col] = ""
+    return rules[RULE_COLUMNS].fillna("")
+
+
+def read_rules_file(file_or_path, filename=None) -> pd.DataFrame:
+    name = (filename or getattr(file_or_path, "name", "") or str(file_or_path)).lower()
+    if name.endswith(".csv"):
+        return standardize_rules(pd.read_csv(file_or_path))
+    if name.endswith((".xlsx", ".xlsm")):
+        xl = pd.ExcelFile(file_or_path)
+        preferred = next((x for x in xl.sheet_names if x.strip().lower() == "rule engine"), xl.sheet_names[0])
+        # Dummy workbook has title in row 1 and headers in row 2.
+        probe = pd.read_excel(xl, sheet_name=preferred, header=None, nrows=4)
+        header_row = 0
+        for i in range(len(probe)):
+            vals = probe.iloc[i].astype(str).str.upper().tolist()
+            if "RULE_ID" in vals and "RULE_TYPE" in vals:
+                header_row = i
+                break
+        return standardize_rules(pd.read_excel(xl, sheet_name=preferred, header=header_row))
+    raise ValueError("Rule file must be CSV or XLSX.")
+
+
+def load_default_rules() -> pd.DataFrame:
+    if os.path.exists(RULES_XLSX_PATH):
+        return read_rules_file(RULES_XLSX_PATH, RULES_XLSX_PATH)
+    if os.path.exists(RULES_PATH):
+        return read_rules_file(RULES_PATH, RULES_PATH)
+    return standardize_rules(pd.DataFrame())
+
+
+def apply_metadata_medication_rules(review: pd.DataFrame, rules: pd.DataFrame) -> pd.DataFrame:
+    out = review.copy()
+    out["METADATA_MED_MATCHFL"] = "N"
+    out["METADATA_MED_RULE_IDS"] = ""
+    enabled = rules[
+        rules["ENABLED"].astype(str).str.upper().isin(["Y", "YES", "TRUE", "1"])
+        & rules["RULE_TYPE"].astype(str).str.upper().eq("MEDICATION_MATCH")
+    ]
+    if enabled.empty:
+        return out
+    ids_by_row = {idx: [] for idx in out.index}
+    for _, rule in enabled.iterrows():
+        fields = [x.strip().upper() for x in str(rule["MATCH_FIELDS"]).split("|") if x.strip()]
+        terms = [x.strip().upper() for x in str(rule["PARAMETER"]).split("|") if x.strip()]
+        if not fields or not terms:
+            continue
+        combined = pd.Series("", index=out.index, dtype="object")
+        for field in fields:
+            if field in out.columns:
+                combined = combined + " " + out[field].fillna("").astype(str).str.upper()
+        mask = pd.Series(False, index=out.index)
+        for term in terms:
+            mask = mask | combined.str.contains(re.escape(term), regex=True, na=False)
+        for idx in out.index[mask]:
+            ids_by_row[idx].append(str(rule["RULE_ID"]))
+    for idx, ids in ids_by_row.items():
+        if ids:
+            out.at[idx, "METADATA_MED_MATCHFL"] = "Y"
+            out.at[idx, "METADATA_MED_RULE_IDS"] = ", ".join(sorted(set(ids)))
+    return out
+
+def document_metadata(uploaded_file, document_type: str) -> dict:
+    if uploaded_file is None:
+        return {"Document Type": document_type, "File Name": "Not uploaded", "Version": "Not specified", "Date": "Not specified", "SHA-256": ""}
+    content = uploaded_file.getvalue()
+    return {
+        "Document Type": document_type,
+        "File Name": uploaded_file.name,
+        "Version": "User supplied",
+        "Date": datetime.now().strftime("%Y-%m-%d"),
+        "SHA-256": hashlib.sha256(content).hexdigest()[:16],
+    }
+
+
+def evaluate_study_rules(review: pd.DataFrame, data: dict, rules: pd.DataFrame):
+    findings = []
+    if review.empty or rules.empty:
+        return review, pd.DataFrame()
+
+    enabled = rules[rules["ENABLED"].astype(str).str.upper().isin(["Y", "YES", "TRUE", "1"])].copy()
+    dv = data.get("dv", pd.DataFrame()).copy()
+    if not dv.empty:
+        for col in ["USUBJID", "IMPORTANT", "DVCAT", "DVTERM"]:
+            if col not in dv.columns:
+                dv[col] = pd.NA
+
+    def add_finding(idx, row, rule, observed, status="Triggered"):
+        findings.append({
+            "ROW_ID": idx,
+            "STUDYID": row.get("STUDYID", ""),
+            "USUBJID": row.get("USUBJID", ""),
+            "CMSEQ": row.get("CMSEQ", ""),
+            "CMTRT": row.get("CMTRT", ""),
+            "RULE_ID": rule["RULE_ID"],
+            "SOURCE": rule["SOURCE"],
+            "SECTION": rule["SECTION"],
+            "RULE_NAME": rule["RULE_NAME"],
+            "SEVERITY": rule["SEVERITY"],
+            "EXPECTED": rule["EXPECTED_VALUE"],
+            "OBSERVED": observed,
+            "FINDING_STATUS": status,
+            "DESCRIPTION": rule["DESCRIPTION"],
+        })
+
+    for _, rule in enabled.iterrows():
+        rtype = str(rule["RULE_TYPE"]).strip().upper()
+        if rtype == "POST_TREATMENT_WINDOW_DAYS":
+            continue
+        for idx, row in review.iterrows():
+            if rtype == "PROHIBITED_OVERLAP" and row.get("PROHMEDFL") == "Y" and row.get("OVERLAPFL") == "Y":
+                add_finding(idx, row, rule, "Prohibited medication overlaps restricted window")
+            elif rtype == "PROHIBITED_REQUIRES_DV" and row.get("PROHMEDFL") == "Y" and row.get("DV_RECON_STATUS") != "Matched in DV":
+                add_finding(idx, row, rule, str(row.get("DV_RECON_STATUS", "Missing")))
+            elif rtype == "BASELINE_PROHIBITED_REVIEW":
+                cm_start = row.get("CMSTDTC_DT")
+                trt_start = row.get("TRTSDT")
+                if row.get("PROHMEDFL") == "Y" and pd.notna(cm_start) and pd.notna(trt_start) and cm_start <= trt_start:
+                    add_finding(idx, row, rule, "Prohibited medication present at/before first dose")
+            elif rtype == "RESTRICTED_MED_APPROVAL_REVIEW":
+                parameter = str(rule.get("PARAMETER", "")).upper().strip()
+                med = f"{row.get('CMTRT','')} {row.get('CMDECOD','')}".upper()
+                if parameter and parameter in med and row.get("OVERLAPFL") == "Y":
+                    add_finding(idx, row, rule, f"{parameter} overlaps restricted window; approval field unavailable")
+            elif rtype == "MISSING_ATC_CODING" and row.get("PROHMEDFL") == "Y":
+                atc_code = str(row.get("ATC1CD", "")).strip()
+                atc_class = str(row.get("ATC1", "")).strip()
+                if not atc_code or atc_code.lower() in ["nan", "<na>"] or not atc_class or atc_class.lower() in ["nan", "<na>"]:
+                    add_finding(idx, row, rule, "ATC code or class missing")
+            elif rtype == "WASHOUT_DAYS" and row.get("PROHMEDFL") == "Y":
+                cm_end = row.get("CMENDTC_DT")
+                trt_start = row.get("TRTSDT")
+                try:
+                    required_days = int(float(rule.get("PARAMETER", 14) or 14))
+                except Exception:
+                    required_days = 14
+                if pd.notna(cm_end) and pd.notna(trt_start) and cm_end < trt_start:
+                    observed_days = (trt_start - cm_end).days
+                    if observed_days < required_days:
+                        add_finding(idx, row, rule, f"Observed washout {observed_days} days; required {required_days}")
+            elif rtype == "MEDICATION_MATCH" and str(row.get("METADATA_MED_RULE_IDS", "")):
+                if str(rule.get("RULE_ID", "")) in str(row.get("METADATA_MED_RULE_IDS", "")).split(", "):
+                    add_finding(idx, row, rule, f"Medication matched metadata rule {rule.get('RULE_ID','')}")
+
+        if rtype == "IMPORTANT_DV_VISIBLE" and not dv.empty:
+            important = dv[dv["IMPORTANT"].astype(str).str.upper().isin(["Y", "YES", "IMPORTANT"])]
+            visible_subjects = set(review.get("USUBJID", pd.Series(dtype=str)).astype(str))
+            for _, drow in important.iterrows():
+                if str(drow.get("USUBJID", "")) not in visible_subjects:
+                    findings.append({
+                        "ROW_ID": "", "STUDYID": drow.get("STUDYID", ""), "USUBJID": drow.get("USUBJID", ""),
+                        "CMSEQ": "", "CMTRT": "", "RULE_ID": rule["RULE_ID"], "SOURCE": rule["SOURCE"],
+                        "SECTION": rule["SECTION"], "RULE_NAME": rule["RULE_NAME"], "SEVERITY": rule["SEVERITY"],
+                        "EXPECTED": rule["EXPECTED_VALUE"], "OBSERVED": "Important DV subject not represented in CM review",
+                        "FINDING_STATUS": "Triggered", "DESCRIPTION": rule["DESCRIPTION"],
+                    })
+
+    findings_df = pd.DataFrame(findings)
+    out = review.copy()
+    out["RULE_COUNT"] = 0
+    out["RULE_IDS"] = ""
+    out["RULE_SUMMARY"] = ""
+    if not findings_df.empty:
+        row_findings = findings_df[findings_df["ROW_ID"].astype(str) != ""].copy()
+        if not row_findings.empty:
+            grouped = row_findings.groupby("ROW_ID").agg(
+                RULE_COUNT=("RULE_ID", "size"),
+                RULE_IDS=("RULE_ID", lambda x: ", ".join(sorted(set(map(str, x))))),
+                RULE_SUMMARY=("RULE_NAME", lambda x: "; ".join(dict.fromkeys(map(str, x))))
+            )
+            for idx, vals in grouped.iterrows():
+                if idx in out.index:
+                    out.loc[idx, ["RULE_COUNT", "RULE_IDS", "RULE_SUMMARY"]] = [vals["RULE_COUNT"], vals["RULE_IDS"], vals["RULE_SUMMARY"]]
+    out["RULE_COUNT"] = pd.to_numeric(out["RULE_COUNT"], errors="coerce").fillna(0).astype(int)
+    return out, findings_df
+
+def prepare_review_dataset(data, rules):
     dm = data.get("dm", pd.DataFrame()).copy()
     ex = data.get("ex", pd.DataFrame()).copy()
     cm = data.get("cm", pd.DataFrame()).copy()
@@ -157,7 +399,8 @@ def prepare_review_dataset(data):
 
     review = cm.merge(ex_win, on="USUBJID", how="left")
     review["RESTRICT_START"] = review["TRTSDT"]
-    review["RESTRICT_END"] = review["TRTEDT"] + pd.Timedelta(days=30)
+    window_days = int(data.get("window_days", 30))
+    review["RESTRICT_END"] = review["TRTEDT"] + pd.Timedelta(days=window_days)
     review["OVERLAPFL"] = (
         review["CMSTDTC_DT"].notna()
         & review["CMENDTC_DT"].notna()
@@ -184,7 +427,9 @@ def prepare_review_dataset(data):
     cmtrt = review["CMTRT"].fillna("").astype(str).str.upper().str.strip()
     protocol_match = cmdecod.isin(prohibited_terms) | cmtrt.isin(prohibited_terms)
     existing_proh = review["PROHFL"].fillna("").astype(str).str.upper().str.strip().isin(["Y", "YES", "TRUE", "1"])
-    review["PROHMEDFL"] = (protocol_match | existing_proh).map({True: "Y", False: "N"})
+    review = apply_metadata_medication_rules(review, rules)
+    metadata_match = review["METADATA_MED_MATCHFL"].eq("Y")
+    review["PROHMEDFL"] = (protocol_match | existing_proh | metadata_match).map({True: "Y", False: "N"})
 
     # Add protocol rationale/category from prohibited list.
     if not prohibited.empty and "CMDECOD" in prohibited.columns:
@@ -270,29 +515,80 @@ st.title(APP_TITLE)
 st.caption(APP_SUBTITLE)
 
 with st.sidebar:
-    st.header("Data")
-    mode = st.radio("Choose data source", ["Use bundled dummy data", "Upload full dummy package zip", "Upload individual CSV files"])
-    uploaded_zip = None
-    uploaded_csvs = None
+    st.header("Study Inputs")
+    st.caption("Upload each controlled input separately. Uploaded files override bundled dummy content for the current session.")
 
-    if mode == "Upload full dummy package zip":
-        uploaded_zip = st.file_uploader("Upload Dummy_Oncology_Study_Package.zip", type=["zip"])
-    elif mode == "Upload individual CSV files":
-        uploaded_csvs = st.file_uploader(
-            "Upload CSV files: dm, ex, cm, ae, dv, ds, lb, vs, prohibited list, dictionary",
-            type=["csv"],
-            accept_multiple_files=True,
+    with st.expander("1. Protocol Upload", expanded=True):
+        protocol_file = st.file_uploader(
+            "Upload approved study protocol",
+            type=["docx", "pdf", "txt"],
+            key="protocol",
+            help="Used for document registration and traceability. Executable logic is supplied through the rule file.",
         )
+        st.caption("Bundled default: Dummy_Oncology_Protocol_DUM_ONC_001.docx")
+
+    with st.expander("2. SAP Upload", expanded=True):
+        sap_file = st.file_uploader(
+            "Upload approved Statistical Analysis Plan",
+            type=["docx", "pdf", "txt"],
+            key="sap",
+            help="Used for SAP version traceability and study-specific analysis conventions.",
+        )
+        bundled_sap_path = os.path.join(DATA_DIR, "Documents", "Dummy_Oncology_SAP_DUM_ONC_001.docx")
+        if os.path.exists(bundled_sap_path):
+            with open(bundled_sap_path, "rb") as _sap:
+                st.download_button("Download bundled dummy SAP", _sap.read(), file_name="Dummy_Oncology_SAP_DUM_ONC_001.docx")
+
+    with st.expander("3. Rule File Upload", expanded=True):
+        rules_file = st.file_uploader(
+            "Upload executable study rules",
+            type=["xlsx", "xlsm", "csv"],
+            key="rules",
+            help="Preferred: Excel workbook with a 'Rule Engine' sheet. CSV is also supported.",
+        )
+        if os.path.exists(RULES_XLSX_PATH):
+            with open(RULES_XLSX_PATH, "rb") as _rules_xlsx:
+                st.download_button("Download dummy Excel rule file", _rules_xlsx.read(), file_name="Study_Rules_DUM_ONC_001.xlsx")
+        if os.path.exists(RULES_PATH):
+            with open(RULES_PATH, "rb") as _rules:
+                st.download_button("Download CSV rule template", _rules.read(), file_name="active_rule_engine.csv")
+
+    with st.expander("4. Dataset Upload", expanded=True):
+        mode = st.radio(
+            "Dataset source",
+            ["Use bundled dummy data", "Upload study package ZIP", "Upload individual datasets"],
+            key="dataset_mode",
+        )
+        uploaded_zip = None
+        uploaded_csvs = None
+        if mode == "Upload study package ZIP":
+            uploaded_zip = st.file_uploader("Upload study package ZIP", type=["zip"], key="dataset_zip", help="ZIP may contain CSV, SAS7BDAT, or XPT domains. SAS7BDAT is preferred when duplicate domain formats exist, followed by XPT and CSV.")
+        elif mode == "Upload individual datasets":
+            uploaded_csvs = st.file_uploader(
+                "Upload SDTM datasets and terminology files",
+                type=["csv", "xpt", "xport", "sas7bdat"],
+                accept_multiple_files=True,
+                key="dataset_files",
+                help="Use domain filenames such as dm.xpt, cm.sas7bdat, dv.csv. Terminology files remain CSV.",
+            )
 
 try:
-    if mode == "Upload full dummy package zip" and uploaded_zip is not None:
+    if mode == "Upload study package ZIP" and uploaded_zip is not None:
         data = load_uploaded_zip(uploaded_zip)
-    elif mode == "Upload individual CSV files" and uploaded_csvs:
-        data = load_uploaded_csvs(uploaded_csvs)
+    elif mode == "Upload individual datasets" and uploaded_csvs:
+        data = load_uploaded_datasets(uploaded_csvs)
     else:
         data = load_default_data()
 
-    review, info = prepare_review_dataset(data)
+    rules = read_rules_file(rules_file, rules_file.name) if rules_file is not None else load_default_rules()
+    window_rule = rules[rules["RULE_TYPE"].astype(str).str.upper().eq("POST_TREATMENT_WINDOW_DAYS")]
+    if not window_rule.empty:
+        try:
+            data["window_days"] = int(float(window_rule.iloc[0]["PARAMETER"]))
+        except Exception:
+            data["window_days"] = 30
+    review, info = prepare_review_dataset(data, rules)
+    review, rule_findings = evaluate_study_rules(review, data, rules)
 except Exception as e:
     st.error("Data could not be processed. Please confirm the uploaded package includes Source_CSV/cm.csv and related SDTM files.")
     with st.expander("Technical detail"):
@@ -306,7 +602,9 @@ if info.get("error"):
 with st.expander("Loaded domain summary", expanded=False):
     summary = []
     for k, df in data.items():
-        summary.append({"Dataset": k.upper(), "Rows": len(df), "Columns": len(df.columns), "Column Names": ", ".join(list(df.columns)[:20])})
+        if isinstance(df, pd.DataFrame):
+            summary.append({"Dataset": k.upper(), "Rows": len(df), "Columns": len(df.columns), "Column Names": ", ".join(list(df.columns)[:20])})
+    st.caption(f"Loaded formats: {data.get('source_formats', 'Unknown')}")
     st.dataframe(pd.DataFrame(summary), use_container_width=True)
 
 # Sidebar filters
@@ -342,20 +640,22 @@ if proh_only:
     f = f[f["PROHMEDFL"] == "Y"]
 
 # KPI row
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 with c1: render_metric("Subjects", review["USUBJID"].nunique() if "USUBJID" in review.columns else 0)
 with c2: render_metric("CM Records", len(review))
 with c3: render_metric("Prohibited Med Records", int((review["PROHMEDFL"] == "Y").sum()))
 with c4: render_metric("Important PD Candidates", int((review["IPD_FL"] == "Y").sum()))
 with c5: render_metric("Potential Missing DV", int((review["DV_RECON_STATUS"] == "Potential Missing DV").sum()))
 with c6: render_metric("Critical Risk", int((review["RISK_LEVEL"] == "Critical").sum()))
+with c7: render_metric("Rule Findings", len(rule_findings))
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "Executive Summary",
     "Subject Review",
     "DV Reconciliation",
     "Protocol Medication List",
     "Data Quality Checks",
+    "Study Rules & Traceability",
 ])
 
 with tab1:
@@ -390,7 +690,7 @@ with tab2:
         "STUDYID", "USUBJID", "SUBJID", "SITEID", "COUNTRY", "ARM", "SEX", "AGE",
         "CMSEQ", "CMTRT", "CMDECOD", "ATC1CD", "ATC1", "CMSTDTC", "CMENDTC",
         "TRTSDT", "TRTEDT", "RESTRICT_START", "RESTRICT_END",
-        "PROHMEDFL", "OVERLAPFL", "IPD_FL", "RISK_LEVEL",
+        "PROHMEDFL", "METADATA_MED_MATCHFL", "METADATA_MED_RULE_IDS", "OVERLAPFL", "IPD_FL", "RISK_LEVEL", "RULE_COUNT", "RULE_IDS", "RULE_SUMMARY",
         "AE_COUNT", "SERIOUS_AE_COUNT", "DV_RECON_STATUS", "REVIEW_STATUS",
         "PROTOCOL RATIONALE", "DEVIATION CLASSIFICATION",
         "MEDICAL_REVIEW_COMMENT", "PROGRAMMING_NOTE"
@@ -450,5 +750,54 @@ with tab5:
         use_container_width=True,
         hide_index=True,
     )
+
+
+with tab6:
+    st.subheader("Protocol/SAP Rule Adoption and Traceability")
+    st.info("Documents provide controlled provenance. Executable checks are maintained in the study-rules workbook/CSV so each rule is reviewable, versionable, testable, and traceable to a protocol or SAP section.")
+
+    doc_rows = [
+        document_metadata(protocol_file, "Protocol") if protocol_file is not None else {
+            "Document Type": "Protocol", "File Name": "Dummy_Oncology_Protocol_DUM_ONC_001.docx (bundled source)",
+            "Version": "Dummy protocol", "Date": "2026-07-08", "SHA-256": "Bundled package"
+        },
+        document_metadata(sap_file, "SAP") if sap_file is not None else {
+            "Document Type": "SAP", "File Name": "Dummy_Oncology_SAP_DUM_ONC_001.docx (bundled source)",
+            "Version": "1.0 (Dummy)", "Date": "2026-07-16", "SHA-256": "Bundled package"
+        }
+    ]
+    st.markdown("**Document Register**")
+    st.dataframe(pd.DataFrame(doc_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("**Executable Study Rules**")
+    edited_rules = st.data_editor(
+        rules,
+        use_container_width=True,
+        hide_index=True,
+        disabled=["RULE_ID"],
+        column_config={"ENABLED": st.column_config.SelectboxColumn("Enabled", options=["Y", "N"])},
+        key="study_rule_editor",
+    )
+    st.download_button(
+        "Download current study rules",
+        edited_rules.to_csv(index=False).encode("utf-8"),
+        file_name="active_rule_engine.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("**Triggered Rule Findings**")
+    if rule_findings.empty:
+        st.success("No enabled study rules triggered.")
+    else:
+        st.dataframe(rule_findings, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download rule findings",
+            rule_findings.to_csv(index=False).encode("utf-8"),
+            file_name="study_rule_findings.csv",
+            mime="text/csv",
+        )
+
+    st.markdown("**Rule Governance Workflow**")
+    st.markdown("1. Register the approved protocol and SAP versions.  2. Translate relevant sections into executable rules.  3. Obtain clinical, statistics, data-management, and programming approval.  4. Validate each rule using known positive and negative test cases.  5. Freeze and version the rule file for each data cut.  6. Retain rule ID, source section, result, reviewer decision, and audit evidence.")
 
 st.caption("Dashboard logic is for demonstration using dummy oncology SDTM-like data. Medical review and protocol interpretation should confirm final Important Protocol Deviation decisions.")
