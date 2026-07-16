@@ -352,6 +352,12 @@ def _fields_for_rule(rule) -> list[str]:
 
 
 def assess_rule_readiness(rules: pd.DataFrame, data: dict, validation_results: pd.DataFrame) -> pd.DataFrame:
+    readiness_columns = [
+        "RULE_ID", "SOURCE", "SECTION", "RULE_NAME", "RULE_TYPE",
+        "DOMAIN", "ENABLED", "READINESS", "EXECUTION", "DETAIL"
+    ]
+    if rules is None or not isinstance(rules, pd.DataFrame) or rules.empty:
+        return pd.DataFrame(columns=readiness_columns)
     rows = []
     global_block = validation_has_blockers(validation_results)
     for _, rule in rules.iterrows():
@@ -425,7 +431,7 @@ def assess_rule_readiness(rules: pd.DataFrame, data: dict, validation_results: p
             "EXECUTION": execution,
             "DETAIL": "; ".join(reasons) if reasons else "All required domains, variables, and parameters are available.",
         })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=readiness_columns)
 
 
 def available_atc_columns(df: pd.DataFrame) -> list[str]:
@@ -905,17 +911,33 @@ try:
     rule_readiness = assess_rule_readiness(rules, data, validation_results)
     critical_validation_block = validation_has_blockers(validation_results)
     review, info = prepare_review_dataset(data, rules)
-    ready_rule_ids = set(rule_readiness.loc[rule_readiness["READINESS"].isin(["Ready", "Conditionally Ready"]), "RULE_ID"].astype(str))
-    executable_rules = rules[rules["RULE_ID"].astype(str).isin(ready_rule_ids)].copy()
+    if rule_readiness.empty or not {"READINESS", "RULE_ID"}.issubset(rule_readiness.columns):
+        ready_rule_ids = set()
+        executable_rules = rules.iloc[0:0].copy()
+    else:
+        ready_rule_ids = set(
+            rule_readiness.loc[
+                rule_readiness["READINESS"].isin(["Ready", "Conditionally Ready"]),
+                "RULE_ID",
+            ].astype(str)
+        )
+        executable_rules = rules[rules["RULE_ID"].astype(str).isin(ready_rule_ids)].copy()
     if critical_validation_block:
         executable_rules = executable_rules.iloc[0:0].copy()
     review, rule_findings = evaluate_study_rules(review, data, executable_rules)
 except Exception as e:
-    st.error("Data could not be processed. The failure is shown below; the app no longer requires a Source_CSV folder.")
-    st.info("Accepted domain examples include cm.csv, CM.xpt, sdtm_cm.sas7bdat, or nested ZIP paths containing those files.")
-    with st.expander("Technical detail", expanded=True):
-        st.exception(e)
-        st.code(traceback.format_exc())
+    error_text = str(e)
+    if "READINESS" in error_text:
+        st.info("### Next step: Upload a rule file")
+        st.write("Open **Rule File Upload**, upload the Clinexa rule workbook, and then return to **Rule Readiness & Compatibility**.")
+    elif "CM" in error_text.upper() or "USUBJID" in error_text.upper():
+        st.info("### Next step: Upload the required study datasets")
+        st.write("Open **Dataset Upload** and provide at least **DM, EX, CM, and DV** in CSV, XPT/XPORT, SAS7BDAT, or a ZIP package.")
+    else:
+        st.info("### Complete the setup before continuing")
+        st.write("Upload the **rule file** and required **DM, EX, CM, and DV datasets**, then review the Data Validation Center for the next required action.")
+    with st.expander("Technical details for support", expanded=False):
+        st.code(f"{type(e).__name__}: {e}")
     st.stop()
 
 if info.get("error"):
@@ -1058,7 +1080,8 @@ with tab5:
     with v4: st.metric("Not Run", int(status_counts.get("Not Run", 0)))
 
     if critical_validation_block:
-        st.error("Clinical rule execution is blocked because one or more critical validation checks failed.")
+        st.info("### Complete the required data steps before rule execution")
+        st.write("Use the **Action Required** column below to correct each critical validation item. Rules will start automatically after the required domains and variables are available.")
     else:
         st.success("No critical validation blockers were detected. Rules marked Ready may execute.")
 
@@ -1079,7 +1102,9 @@ with tab6:
     st.subheader("Rule Readiness & Compatibility")
     st.caption("Each enabled rule is assessed against uploaded domains, variables, ATC hierarchy, parameters, and critical data-validation results before execution.")
     if rule_readiness.empty:
-        st.warning("No rules were available for readiness assessment.")
+        st.info("### Upload a rule file to run Readiness")
+        st.write("Go to **3. Rule File Upload**, upload the Clinexa Excel rule workbook or CSV rule file, and then return to this tab.")
+        st.caption("Readiness starts after the app can identify executable rules from the Rule Engine sheet.")
     else:
         ready_counts = rule_readiness["READINESS"].value_counts()
         r1, r2, r3, r4 = st.columns(4)
