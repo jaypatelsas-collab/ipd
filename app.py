@@ -10,13 +10,13 @@ import pandas as pd
 import streamlit as st
 
 st.set_page_config(
-    page_title="Oncology IPD Dashboard - Prohibited Medication",
-    page_icon="⚕️",
+    page_title="Clinexa AI | TrialGuard",
+    page_icon="🛡️",
     layout="wide",
 )
 
-APP_TITLE = "Oncology Important Protocol Deviation Dashboard"
-APP_SUBTITLE = "Prohibited Medication Review | Dummy Oncology Study DUM-ONC-001"
+APP_TITLE = "TrialGuard"
+APP_SUBTITLE = "Prohibited Medication & Important Protocol Deviation Review"
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 SRC_DIR = os.path.join(DATA_DIR, "Source_CSV")
@@ -26,6 +26,13 @@ RULES_XLSX_PATH = os.path.join(DATA_DIR, "Study_Rules_DUM_ONC_001.xlsx")
 XPT_DIR = os.path.join(DATA_DIR, "SDTM_XPT")
 
 REQUIRED_DOMAINS = ["dm", "ex", "cm", "ae", "dv", "ds", "lb", "vs"]
+
+# Study datasets may contain ATC hierarchy levels 4 through 7.
+ATC_LEVELS = [4, 5, 6, 7]
+ATC_CODE_COLUMNS = [f"ATC{level}CD" for level in ATC_LEVELS]
+ATC_CLASS_COLUMNS = [f"ATC{level}" for level in ATC_LEVELS]
+ATC_ALL_COLUMNS = [item for level in ATC_LEVELS for item in (f"ATC{level}CD", f"ATC{level}")]
+ATC_LEGACY_ALIASES = ["ATC1CD", "ATC1", "ATC_CODE", "ATC_CLASS", "ATC CODE", "ATC CLASS"]
 
 DATE_COLS = {
     "dm": ["RFSTDTC"],
@@ -127,8 +134,8 @@ def load_uploaded_zip(uploaded_file):
     loaded_formats = []
     with zipfile.ZipFile(uploaded_file) as z:
         names = [n for n in z.namelist() if not n.startswith("__MACOSX/") and not os.path.basename(n).startswith("._")]
-        # Prefer SAS7BDAT, then XPT, then CSV when duplicate domains exist.
-        priority = {".sas7bdat": 3, ".xpt": 2, ".xport": 2, ".csv": 1}
+        # Prefer CSV when duplicate domains exist because it preserves the complete configurable ATC hierarchy; SAS/XPT remain supported when supplied alone.
+        priority = {".csv": 3, ".sas7bdat": 2, ".xpt": 1, ".xport": 1}
         candidates = {}
         for n in names:
             ext = os.path.splitext(n.lower())[1]
@@ -226,6 +233,48 @@ def load_default_rules() -> pd.DataFrame:
     return standardize_rules(pd.DataFrame())
 
 
+
+def available_atc_columns(df: pd.DataFrame) -> list[str]:
+    """Return populated ATC level 4-7 columns, preserving hierarchy order."""
+    cols = []
+    for col in ATC_ALL_COLUMNS + ATC_LEGACY_ALIASES:
+        if col in df.columns and not df[col].isna().all():
+            cols.append(col)
+    return cols
+
+def atc_code_class_columns(df: pd.DataFrame) -> tuple[list[str], list[str]]:
+    code_cols = [c for c in ATC_CODE_COLUMNS if c in df.columns]
+    class_cols = [c for c in ATC_CLASS_COLUMNS if c in df.columns]
+    # Backward compatibility with older files.
+    if not code_cols:
+        code_cols = [c for c in ["ATC1CD", "ATC_CODE", "ATC CODE"] if c in df.columns]
+    if not class_cols:
+        class_cols = [c for c in ["ATC1", "ATC_CLASS", "ATC CLASS"] if c in df.columns]
+    return code_cols, class_cols
+
+def best_atc_category_column(df: pd.DataFrame):
+    """Use the most detailed populated class column (ATC7 down to ATC4)."""
+    for level in reversed(ATC_LEVELS):
+        col = f"ATC{level}"
+        if col in df.columns and not df[col].isna().all():
+            return col
+    for col in ["ATC4 CLASS", "ATC CLASS", "ATC1"]:
+        if col in df.columns and not df[col].isna().all():
+            return col
+    return None
+
+def expand_atc_match_fields(fields: list[str], df: pd.DataFrame) -> list[str]:
+    """Expand generic/legacy ATC fields to every available ATC level 4-7 field."""
+    expanded = []
+    available = available_atc_columns(df)
+    for field in fields:
+        normalized = field.upper().strip()
+        if normalized in {"ATC", "ATC_CODE", "ATC_CLASS", "ATC1", "ATC1CD", "ATC CODE", "ATC CLASS"}:
+            expanded.extend(available)
+        else:
+            expanded.append(normalized)
+    return list(dict.fromkeys(expanded))
+
 def apply_metadata_medication_rules(review: pd.DataFrame, rules: pd.DataFrame) -> pd.DataFrame:
     out = review.copy()
     out["METADATA_MED_MATCHFL"] = "N"
@@ -238,7 +287,7 @@ def apply_metadata_medication_rules(review: pd.DataFrame, rules: pd.DataFrame) -
         return out
     ids_by_row = {idx: [] for idx in out.index}
     for _, rule in enabled.iterrows():
-        fields = [x.strip().upper() for x in str(rule["MATCH_FIELDS"]).split("|") if x.strip()]
+        fields = expand_atc_match_fields([x.strip().upper() for x in str(rule["MATCH_FIELDS"]).split("|") if x.strip()], out)
         terms = [x.strip().upper() for x in str(rule["PARAMETER"]).split("|") if x.strip()]
         if not fields or not terms:
             continue
@@ -320,10 +369,12 @@ def evaluate_study_rules(review: pd.DataFrame, data: dict, rules: pd.DataFrame):
                 if parameter and parameter in med and row.get("OVERLAPFL") == "Y":
                     add_finding(idx, row, rule, f"{parameter} overlaps restricted window; approval field unavailable")
             elif rtype == "MISSING_ATC_CODING" and row.get("PROHMEDFL") == "Y":
-                atc_code = str(row.get("ATC1CD", "")).strip()
-                atc_class = str(row.get("ATC1", "")).strip()
-                if not atc_code or atc_code.lower() in ["nan", "<na>"] or not atc_class or atc_class.lower() in ["nan", "<na>"]:
-                    add_finding(idx, row, rule, "ATC code or class missing")
+                code_cols, class_cols = atc_code_class_columns(review)
+                code_present = any(str(row.get(c, "")).strip().lower() not in ["", "nan", "<na>"] for c in code_cols)
+                class_present = any(str(row.get(c, "")).strip().lower() not in ["", "nan", "<na>"] for c in class_cols)
+                if not code_present or not class_present:
+                    expected = "ATC level 4-7 code and class"
+                    add_finding(idx, row, rule, f"{expected} missing")
             elif rtype == "WASHOUT_DAYS" and row.get("PROHMEDFL") == "Y":
                 cm_end = row.get("CMENDTC_DT")
                 trt_start = row.get("TRTSDT")
@@ -389,7 +440,7 @@ def prepare_review_dataset(data, rules):
         return pd.DataFrame(), {"error": "CM domain is missing or empty."}
 
     # Always create required columns before use.
-    for col in ["STUDYID", "USUBJID", "CMSEQ", "CMTRT", "CMDECOD", "ATC1CD", "ATC1", "CMSTDTC", "CMENDTC", "PROHFL"]:
+    for col in ["STUDYID", "USUBJID", "CMSEQ", "CMTRT", "CMDECOD", "CMSTDTC", "CMENDTC", "PROHFL"]:
         if col not in cm.columns:
             cm[col] = pd.NA
 
@@ -526,11 +577,65 @@ def prepare_review_dataset(data, rules):
 def render_metric(label, value):
     st.metric(label, value)
 
-st.title(APP_TITLE)
-st.caption(APP_SUBTITLE)
+st.markdown(
+    """
+    <style>
+      .clinexa-shell {
+        border: 1px solid #dbe5ef;
+        border-radius: 16px;
+        padding: 1.25rem 1.5rem;
+        margin-bottom: 1rem;
+        background: linear-gradient(135deg, #f7fbff 0%, #ffffff 65%);
+        box-shadow: 0 4px 18px rgba(15, 76, 129, 0.08);
+      }
+      .clinexa-brand {
+        color: #0F4C81;
+        font-size: 1.05rem;
+        font-weight: 750;
+        letter-spacing: 0.02em;
+        margin-bottom: 0.15rem;
+      }
+      .clinexa-platform {
+        color: #64748b;
+        font-size: 0.88rem;
+        margin-bottom: 0.85rem;
+      }
+      .trialguard-title {
+        color: #102a43;
+        font-size: 2.15rem;
+        line-height: 1.1;
+        font-weight: 800;
+        margin: 0;
+      }
+      .trialguard-subtitle {
+        color: #334e68;
+        font-size: 1.05rem;
+        margin-top: 0.35rem;
+      }
+      .module-pill {
+        display: inline-block;
+        margin-top: 0.75rem;
+        padding: 0.28rem 0.65rem;
+        border-radius: 999px;
+        background: #e8f3fb;
+        color: #0F4C81;
+        font-size: 0.78rem;
+        font-weight: 700;
+      }
+    </style>
+    <div class="clinexa-shell">
+      <div class="clinexa-brand">Clinexa AI</div>
+      <div class="clinexa-platform">Clinical Intelligence Platform</div>
+      <div class="trialguard-title">🛡️ TrialGuard</div>
+      <div class="trialguard-subtitle">Prohibited Medication &amp; Important Protocol Deviation Review</div>
+      <div class="module-pill">Initial IPD Dashboard</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
-    st.header("Study Inputs")
+    st.markdown("### Clinexa AI · Study Inputs")
     st.caption("Upload each controlled input separately. Uploaded files override bundled dummy content for the current session.")
 
     with st.expander("1. Protocol Upload", expanded=True):
@@ -697,7 +802,7 @@ with tab1:
             st.bar_chart(f["RISK_LEVEL"].value_counts().reset_index().rename(columns={"RISK_LEVEL":"Risk Level", "count":"Count"}), x="Risk Level", y="Count")
 
         st.markdown("**Medication Category / ATC Class**")
-        cat_col = "ATC CLASS" if "ATC CLASS" in f.columns else ("ATC1" if "ATC1" in f.columns else None)
+        cat_col = best_atc_category_column(f)
         if cat_col and not f.empty:
             st.dataframe(f[f["PROHMEDFL"]=="Y"][cat_col].fillna("Missing").value_counts().reset_index().rename(columns={cat_col:"Category", "count":"Count"}), use_container_width=True)
 
@@ -705,7 +810,7 @@ with tab2:
     st.subheader("Subject-Level Prohibited Medication Review")
     display_cols = [
         "STUDYID", "USUBJID", "SUBJID", "SITEID", "COUNTRY", "ARM", "SEX", "AGE",
-        "CMSEQ", "CMTRT", "CMDECOD", "ATC1CD", "ATC1", "CMSTDTC", "CMENDTC",
+        "CMSEQ", "CMTRT", "CMDECOD", *ATC_ALL_COLUMNS, "CMSTDTC", "CMENDTC",
         "TRTSDT", "TRTEDT", "RESTRICT_START", "RESTRICT_END",
         "PROHMEDFL", "METADATA_MED_MATCHFL", "METADATA_MED_RULE_IDS", "OVERLAPFL", "IPD_FL", "RISK_LEVEL", "RULE_COUNT", "RULE_IDS", "RULE_SUMMARY",
         "AE_COUNT", "SERIOUS_AE_COUNT", "DV_RECON_STATUS", "REVIEW_STATUS",
@@ -817,4 +922,4 @@ with tab6:
     st.markdown("**Rule Governance Workflow**")
     st.markdown("1. Register the approved protocol and SAP versions.  2. Translate relevant sections into executable rules.  3. Obtain clinical, statistics, data-management, and programming approval.  4. Validate each rule using known positive and negative test cases.  5. Freeze and version the rule file for each data cut.  6. Retain rule ID, source section, result, reviewer decision, and audit evidence.")
 
-st.caption("Dashboard logic is for demonstration using dummy oncology SDTM-like data. Medical review and protocol interpretation should confirm final Important Protocol Deviation decisions.")
+st.caption("Clinexa AI · TrialGuard | Demonstration dashboard using dummy oncology SDTM-like data. Medical review and protocol interpretation must confirm final Important Protocol Deviation decisions.")
