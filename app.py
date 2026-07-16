@@ -233,6 +233,200 @@ def load_default_rules() -> pd.DataFrame:
     return standardize_rules(pd.DataFrame())
 
 
+VALIDATION_REQUIRED = {
+    "dm": ["STUDYID", "USUBJID", "SITEID", "COUNTRY", "ARM"],
+    "ex": ["STUDYID", "USUBJID", "EXTRT", "EXSTDTC"],
+    "cm": ["STUDYID", "USUBJID", "CMTRT", "CMSTDTC"],
+    "dv": ["STUDYID", "USUBJID", "DVTERM"],
+}
+
+VALIDATION_RECOMMENDED = {
+    "dm": ["RFSTDTC", "SEX", "AGE"],
+    "ex": ["EXENDTC"],
+    "cm": ["CMDECOD", "CMENDTC", "CMSEQ"],
+    "dv": ["DVCAT", "IMPORTANT", "DVDTC"],
+    "ae": ["USUBJID", "AEDECOD", "AESER", "AESTDTC"],
+}
+
+
+def _result(check_id, domain, check, severity, status, detail, affected=0, action=""):
+    return {
+        "CHECK_ID": check_id,
+        "DOMAIN": domain.upper() if domain else "STUDY",
+        "CHECK": check,
+        "SEVERITY": severity,
+        "STATUS": status,
+        "AFFECTED_RECORDS": int(affected or 0),
+        "DETAIL": detail,
+        "RECOMMENDED_ACTION": action,
+    }
+
+
+def run_data_validation(data: dict) -> pd.DataFrame:
+    results = []
+    dm_subjects = set()
+    study_ids = set()
+
+    for dom in REQUIRED_DOMAINS:
+        df = data.get(dom, pd.DataFrame())
+        required = VALIDATION_REQUIRED.get(dom, [])
+        recommended = VALIDATION_RECOMMENDED.get(dom, [])
+        if dom in VALIDATION_REQUIRED and df.empty:
+            results.append(_result(f"{dom.upper()}001", dom, "Required domain present", "Critical", "Fail", f"{dom.upper()} dataset is missing or empty.", 0, f"Upload a valid {dom.upper()} dataset."))
+            continue
+        if df.empty:
+            results.append(_result(f"{dom.upper()}001", dom, "Optional domain present", "Info", "Not Run", f"{dom.upper()} dataset was not supplied.", 0, "Upload only when required by active rules."))
+            continue
+
+        missing_req = [c for c in required if c not in df.columns]
+        results.append(_result(f"{dom.upper()}002", dom, "Required columns present", "Critical", "Fail" if missing_req else "Pass", ", ".join(missing_req) if missing_req else "All required columns are present.", len(missing_req), "Add or correctly name the missing variables." if missing_req else ""))
+
+        missing_rec = [c for c in recommended if c not in df.columns]
+        results.append(_result(f"{dom.upper()}003", dom, "Recommended columns present", "Warning", "Warning" if missing_rec else "Pass", ", ".join(missing_rec) if missing_rec else "All recommended columns are present.", len(missing_rec), "Confirm whether active rules require these variables." if missing_rec else ""))
+
+        if "USUBJID" in df.columns:
+            blank_subject = df["USUBJID"].isna() | df["USUBJID"].astype(str).str.strip().isin(["", "NAN", "<NA>"])
+            results.append(_result(f"{dom.upper()}004", dom, "Subject identifier populated", "Critical", "Fail" if blank_subject.any() else "Pass", f"{blank_subject.sum()} records have missing USUBJID." if blank_subject.any() else "USUBJID is populated.", blank_subject.sum(), "Correct missing subject identifiers." if blank_subject.any() else ""))
+
+        if "STUDYID" in df.columns:
+            ids = set(df["STUDYID"].dropna().astype(str).str.strip()) - {""}
+            study_ids.update(ids)
+
+        seq_candidates = [c for c in [f"{dom.upper()}SEQ", "SEQ"] if c in df.columns]
+        key_cols = [c for c in ["STUDYID", "USUBJID"] + seq_candidates[:1] if c in df.columns]
+        if len(key_cols) >= 2:
+            dup = df.duplicated(key_cols, keep=False)
+            results.append(_result(f"{dom.upper()}005", dom, "Record key uniqueness", "Warning", "Warning" if dup.any() else "Pass", f"{dup.sum()} records share the same key: {', '.join(key_cols)}." if dup.any() else f"No duplicate keys across {', '.join(key_cols)}.", dup.sum(), "Review duplicates and sequence-variable derivation." if dup.any() else ""))
+
+        for date_col in DATE_COLS.get(dom, []):
+            if date_col in df.columns:
+                raw = df[date_col]
+                nonblank = raw.notna() & ~raw.astype(str).str.strip().isin(["", "NAN", "<NA>"])
+                parsed = pd.to_datetime(raw, errors="coerce")
+                invalid = nonblank & parsed.isna()
+                results.append(_result(f"{dom.upper()}D{date_col}", dom, f"{date_col} parseable", "Warning", "Warning" if invalid.any() else "Pass", f"{invalid.sum()} nonblank values could not be parsed as dates." if invalid.any() else "All nonblank values are parseable.", invalid.sum(), "Use valid ISO 8601 dates or implement approved partial-date handling." if invalid.any() else ""))
+
+        date_pairs = {"ex": ("EXSTDTC", "EXENDTC"), "cm": ("CMSTDTC", "CMENDTC")}
+        if dom in date_pairs:
+            start, end = date_pairs[dom]
+            if start in df.columns and end in df.columns:
+                sdt = pd.to_datetime(df[start], errors="coerce")
+                edt = pd.to_datetime(df[end], errors="coerce")
+                reversed_dates = sdt.notna() & edt.notna() & (sdt > edt)
+                results.append(_result(f"{dom.upper()}006", dom, "Start date is not after end date", "Critical", "Fail" if reversed_dates.any() else "Pass", f"{reversed_dates.sum()} records have {start} after {end}." if reversed_dates.any() else "Date order is valid.", reversed_dates.sum(), "Correct source dates before rule execution." if reversed_dates.any() else ""))
+
+        if dom == "dm" and "USUBJID" in df.columns:
+            dm_subjects = set(df["USUBJID"].dropna().astype(str))
+
+    if len(study_ids) > 1:
+        results.append(_result("STUDY001", "", "Study ID consistency", "Critical", "Fail", f"Multiple STUDYID values were found: {', '.join(sorted(study_ids))}.", len(study_ids), "Upload datasets from one study or explicitly configure a multi-study review."))
+    elif len(study_ids) == 1:
+        results.append(_result("STUDY001", "", "Study ID consistency", "Critical", "Pass", f"All supplied domains resolve to STUDYID {next(iter(study_ids))}."))
+    else:
+        results.append(_result("STUDY001", "", "Study ID consistency", "Critical", "Fail", "No populated STUDYID was found.", 0, "Populate STUDYID in required datasets."))
+
+    if dm_subjects:
+        for dom in ["ex", "cm", "ae", "dv", "ds", "lb", "vs"]:
+            df = data.get(dom, pd.DataFrame())
+            if not df.empty and "USUBJID" in df.columns:
+                orphan = ~df["USUBJID"].astype(str).isin(dm_subjects)
+                results.append(_result(f"{dom.upper()}007", dom, "Subjects reconcile to DM", "Critical", "Fail" if orphan.any() else "Pass", f"{orphan.sum()} records reference subjects absent from DM." if orphan.any() else "All subjects are represented in DM.", orphan.sum(), "Correct USUBJID or upload the matching DM records." if orphan.any() else ""))
+
+    cm = data.get("cm", pd.DataFrame())
+    if not cm.empty:
+        atc_cols = available_atc_columns(cm)
+        status = "Pass" if atc_cols else "Warning"
+        results.append(_result("CMATC001", "cm", "ATC hierarchy available", "Warning", status, f"Detected: {', '.join(atc_cols)}" if atc_cols else "No ATC Level 4-7 or supported legacy ATC columns were detected.", 0, "Add ATC4CD/ATC4 or higher supported hierarchy columns when ATC-based rules are active." if not atc_cols else ""))
+
+    return pd.DataFrame(results)
+
+
+def validation_has_blockers(validation_results: pd.DataFrame) -> bool:
+    if validation_results.empty:
+        return True
+    return bool(((validation_results["SEVERITY"] == "Critical") & (validation_results["STATUS"] == "Fail")).any())
+
+
+def _fields_for_rule(rule) -> list[str]:
+    return [x.strip().upper() for x in str(rule.get("MATCH_FIELDS", "")).split("|") if x.strip()]
+
+
+def assess_rule_readiness(rules: pd.DataFrame, data: dict, validation_results: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    global_block = validation_has_blockers(validation_results)
+    for _, rule in rules.iterrows():
+        enabled = str(rule.get("ENABLED", "")).upper() in ["Y", "YES", "TRUE", "1"]
+        rid = str(rule.get("RULE_ID", ""))
+        rtype = str(rule.get("RULE_TYPE", "")).upper().strip()
+        domain_expr = str(rule.get("DOMAIN", "")).lower().replace(" ", "")
+        domains = [d for d in re.split(r"[+|,]", domain_expr) if d]
+        domains = [d for d in domains if d in REQUIRED_DOMAINS]
+        reasons = []
+        missing_domains = [d.upper() for d in domains if data.get(d, pd.DataFrame()).empty]
+        if missing_domains:
+            reasons.append("Missing domain(s): " + ", ".join(missing_domains))
+
+        available_cols = set()
+        for d in domains:
+            df = data.get(d, pd.DataFrame())
+            available_cols.update(df.columns if isinstance(df, pd.DataFrame) else [])
+        if not domains:
+            for d in REQUIRED_DOMAINS:
+                df = data.get(d, pd.DataFrame())
+                available_cols.update(df.columns if isinstance(df, pd.DataFrame) else [])
+
+        fields = _fields_for_rule(rule)
+        generic_atc = {"ATC", "ATC_CODE", "ATC_CLASS", "ATC1", "ATC1CD", "ATC CODE", "ATC CLASS"}
+        missing_fields = []
+        for field in fields:
+            if field in generic_atc:
+                cm = data.get("cm", pd.DataFrame())
+                if cm.empty or not available_atc_columns(cm):
+                    missing_fields.append(field + " (no ATC4-7 hierarchy detected)")
+            elif field.endswith("_DT"):
+                base = field[:-3]
+                if field not in available_cols and base not in available_cols and field not in {"TRTSDT", "TRTEDT"}:
+                    missing_fields.append(field)
+            elif field not in available_cols and field not in {"PROHMEDFL", "OVERLAPFL", "DV_MATCHFL", "TRTSDT", "TRTEDT", "RESTRICT_START", "RESTRICT_END"}:
+                missing_fields.append(field)
+        if missing_fields:
+            reasons.append("Unavailable field(s): " + ", ".join(missing_fields))
+
+        parameter = str(rule.get("PARAMETER", "")).strip()
+        if rtype in {"MEDICATION_MATCH", "RESTRICTED_MED_APPROVAL_REVIEW", "WASHOUT_DAYS", "POST_TREATMENT_WINDOW_DAYS"} and not parameter:
+            reasons.append("PARAMETER is required for this rule type")
+        if not rid:
+            reasons.append("RULE_ID is blank")
+        if not rtype:
+            reasons.append("RULE_TYPE is blank")
+
+        if not enabled:
+            status = "Disabled"
+            execution = "Will not run"
+        elif reasons:
+            status = "Not Ready"
+            execution = "Blocked"
+        elif global_block:
+            status = "Conditionally Ready"
+            execution = "Blocked by critical data validation"
+        else:
+            status = "Ready"
+            execution = "Can run"
+
+        rows.append({
+            "RULE_ID": rid,
+            "SOURCE": rule.get("SOURCE", ""),
+            "SECTION": rule.get("SECTION", ""),
+            "RULE_NAME": rule.get("RULE_NAME", ""),
+            "RULE_TYPE": rtype,
+            "DOMAIN": rule.get("DOMAIN", ""),
+            "ENABLED": rule.get("ENABLED", ""),
+            "READINESS": status,
+            "EXECUTION": execution,
+            "DETAIL": "; ".join(reasons) if reasons else "All required domains, variables, and parameters are available.",
+        })
+    return pd.DataFrame(rows)
+
 
 def available_atc_columns(df: pd.DataFrame) -> list[str]:
     """Return populated ATC level 4-7 columns, preserving hierarchy order."""
@@ -668,7 +862,7 @@ with st.sidebar:
         )
         if os.path.exists(RULES_XLSX_PATH):
             with open(RULES_XLSX_PATH, "rb") as _rules_xlsx:
-                st.download_button("Download dummy Excel rule file", _rules_xlsx.read(), file_name="Study_Rules_DUM_ONC_001.xlsx")
+                st.download_button("Download rule workbook with update instructions", _rules_xlsx.read(), file_name="Clinexa_Study_Rules_DUM_ONC_001_with_Instructions.xlsx")
         if os.path.exists(RULES_PATH):
             with open(RULES_PATH, "rb") as _rules:
                 st.download_button("Download CSV rule template", _rules.read(), file_name="active_rule_engine.csv")
@@ -707,8 +901,15 @@ try:
             data["window_days"] = int(float(window_rule.iloc[0]["PARAMETER"]))
         except Exception:
             data["window_days"] = 30
+    validation_results = run_data_validation(data)
+    rule_readiness = assess_rule_readiness(rules, data, validation_results)
+    critical_validation_block = validation_has_blockers(validation_results)
     review, info = prepare_review_dataset(data, rules)
-    review, rule_findings = evaluate_study_rules(review, data, rules)
+    ready_rule_ids = set(rule_readiness.loc[rule_readiness["READINESS"].isin(["Ready", "Conditionally Ready"]), "RULE_ID"].astype(str))
+    executable_rules = rules[rules["RULE_ID"].astype(str).isin(ready_rule_ids)].copy()
+    if critical_validation_block:
+        executable_rules = executable_rules.iloc[0:0].copy()
+    review, rule_findings = evaluate_study_rules(review, data, executable_rules)
 except Exception as e:
     st.error("Data could not be processed. The failure is shown below; the app no longer requires a Source_CSV folder.")
     st.info("Accepted domain examples include cm.csv, CM.xpt, sdtm_cm.sas7bdat, or nested ZIP paths containing those files.")
@@ -771,12 +972,13 @@ with c5: render_metric("Potential Missing DV", int((review["DV_RECON_STATUS"] ==
 with c6: render_metric("Critical Risk", int((review["RISK_LEVEL"] == "Critical").sum()))
 with c7: render_metric("Rule Findings", len(rule_findings))
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "Executive Summary",
     "Subject Review",
     "DV Reconciliation",
     "Protocol Medication List",
-    "Data Quality Checks",
+    "Data Validation Center",
+    "Rule Readiness",
     "Study Rules & Traceability",
 ])
 
@@ -845,36 +1047,55 @@ with tab4:
         st.dataframe(whodrug, use_container_width=True, hide_index=True)
 
 with tab5:
-    st.subheader("Data Quality Checks")
-    checks = []
-    domain_expected = {
-        "dm": ["STUDYID", "USUBJID", "SITEID", "COUNTRY", "ARM", "RFSTDTC"],
-        "ex": ["USUBJID", "EXTRT", "EXSTDTC", "EXENDTC"],
-        "cm": ["USUBJID", "CMTRT", "CMDECOD", "CMSTDTC", "CMENDTC", "PROHFL"],
-        "ae": ["USUBJID", "AEDECOD", "AESER", "AESTDTC"],
-        "dv": ["USUBJID", "DVCAT", "DVTERM", "IMPORTANT", "DVDTC"],
-    }
-    for dom, cols in domain_expected.items():
-        df = data.get(dom, pd.DataFrame())
-        missing = [c for c in cols if c not in df.columns]
-        checks.append({
-            "Domain": dom.upper(),
-            "Rows": len(df),
-            "Status": "Pass" if not missing and len(df) > 0 else "Review",
-            "Missing Columns": ", ".join(missing)
-        })
-    st.dataframe(pd.DataFrame(checks), use_container_width=True, hide_index=True)
+    st.subheader("Data Validation Center")
+    st.caption("Critical failures block clinical rule execution. Warnings allow execution but require review and documented acceptance.")
 
-    st.markdown("**Records requiring review**")
-    st.dataframe(
-        review[(review["PROHMEDFL"] == "Y") & ((review["OVERLAPFL"] == "N") | (review["DV_MATCHFL"] == "N"))]
-        [[c for c in ["USUBJID", "CMTRT", "CMDECOD", "CMSTDTC", "CMENDTC", "OVERLAPFL", "IPD_FL", "DV_RECON_STATUS", "REVIEW_STATUS"] if c in review.columns]],
-        use_container_width=True,
-        hide_index=True,
-    )
+    status_counts = validation_results["STATUS"].value_counts() if not validation_results.empty else pd.Series(dtype=int)
+    v1, v2, v3, v4 = st.columns(4)
+    with v1: st.metric("Passed", int(status_counts.get("Pass", 0)))
+    with v2: st.metric("Warnings", int(status_counts.get("Warning", 0)))
+    with v3: st.metric("Critical Failures", int(((validation_results["SEVERITY"] == "Critical") & (validation_results["STATUS"] == "Fail")).sum()) if not validation_results.empty else 0)
+    with v4: st.metric("Not Run", int(status_counts.get("Not Run", 0)))
+
+    if critical_validation_block:
+        st.error("Clinical rule execution is blocked because one or more critical validation checks failed.")
+    else:
+        st.success("No critical validation blockers were detected. Rules marked Ready may execute.")
+
+    severity_filter = st.multiselect("Validation severity", ["Critical", "Warning", "Info"], default=["Critical", "Warning", "Info"], key="validation_severity")
+    status_filter_validation = st.multiselect("Validation status", ["Fail", "Warning", "Pass", "Not Run"], default=["Fail", "Warning", "Pass", "Not Run"], key="validation_status")
+    validation_view = validation_results[
+        validation_results["SEVERITY"].isin(severity_filter) & validation_results["STATUS"].isin(status_filter_validation)
+    ] if not validation_results.empty else validation_results
+    st.dataframe(validation_view, use_container_width=True, hide_index=True)
+    st.download_button("Download validation report", validation_results.to_csv(index=False).encode("utf-8"), file_name="clinexa_data_validation_report.csv", mime="text/csv")
+
+    st.markdown("**Records requiring clinical/data review**")
+    review_subset = review[(review["PROHMEDFL"] == "Y") & ((review["OVERLAPFL"] == "N") | (review["DV_MATCHFL"] == "N"))]
+    st.dataframe(review_subset[[c for c in ["USUBJID", "CMTRT", "CMDECOD", "CMSTDTC", "CMENDTC", "OVERLAPFL", "IPD_FL", "DV_RECON_STATUS", "REVIEW_STATUS"] if c in review_subset.columns]], use_container_width=True, hide_index=True)
 
 
 with tab6:
+    st.subheader("Rule Readiness & Compatibility")
+    st.caption("Each enabled rule is assessed against uploaded domains, variables, ATC hierarchy, parameters, and critical data-validation results before execution.")
+    if rule_readiness.empty:
+        st.warning("No rules were available for readiness assessment.")
+    else:
+        ready_counts = rule_readiness["READINESS"].value_counts()
+        r1, r2, r3, r4 = st.columns(4)
+        with r1: st.metric("Ready", int(ready_counts.get("Ready", 0)))
+        with r2: st.metric("Conditionally Ready", int(ready_counts.get("Conditionally Ready", 0)))
+        with r3: st.metric("Not Ready", int(ready_counts.get("Not Ready", 0)))
+        with r4: st.metric("Disabled", int(ready_counts.get("Disabled", 0)))
+        readiness_filter = st.multiselect("Readiness", ["Ready", "Conditionally Ready", "Not Ready", "Disabled"], default=["Ready", "Conditionally Ready", "Not Ready", "Disabled"], key="rule_readiness_filter")
+        st.dataframe(rule_readiness[rule_readiness["READINESS"].isin(readiness_filter)], use_container_width=True, hide_index=True)
+        st.download_button("Download rule-readiness report", rule_readiness.to_csv(index=False).encode("utf-8"), file_name="clinexa_rule_readiness_report.csv", mime="text/csv")
+        not_ready = rule_readiness[rule_readiness["READINESS"] == "Not Ready"]
+        if not not_ready.empty:
+            st.warning(f"{len(not_ready)} enabled rule(s) cannot execute. Correct the listed domains, fields, or parameters before relying on results.")
+
+
+with tab7:
     st.subheader("Protocol/SAP Rule Adoption and Traceability")
     st.info("Documents provide controlled provenance. Executable checks are maintained in the study-rules workbook/CSV so each rule is reviewable, versionable, testable, and traceable to a protocol or SAP section.")
 
