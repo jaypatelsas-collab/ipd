@@ -828,7 +828,7 @@ st.markdown(
       <div class="clinexa-platform">Clinical Intelligence Platform</div>
       <div class="trialguard-title">🛡️ TrialGuard</div>
       <div class="trialguard-subtitle">Prohibited Medication &amp; Important Protocol Deviation Review</div>
-      <div class="module-pill">Initial IPD Dashboard</div>
+      <div class="module-pill">IPD Dashboard</div>
     </div>
     """,
     unsafe_allow_html=True,
